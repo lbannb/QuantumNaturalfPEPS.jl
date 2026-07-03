@@ -1,21 +1,24 @@
 
 # Calculates the Energy and Gradient of a given peps and hamiltonian
-function Ok_and_Ek(peps::AbstractPEPS, ham_op; trial_state::AbstractTrialState=IdentityState(dim(siteinds(peps)[1])), 
+function Ok_and_Ek(peps::AbstractPEPS, ham_op; trial_state::AbstractTrialState=IdentityState(dim(siteinds(peps)[1])),
                    timer=TimerOutput(), Ok=nothing, sampling_mode=:full,
                    resample=false, correct_sampling_error=true, resample_energy=0, # TODO: remove
+                   slow_energy=false, slow_energy_pos=(size(peps, 1)-1) ÷ 2,
                    )
-    
+
     S, logpc, env_top = @timeit timer "sampling" get_sample(peps; trial_state=trial_state, mode=sampling_mode, timer) # draw a sample
-    
+
     if resample
         S = QuantumNaturalGradient.resample_with_H(S, ham_op; resample_energy)
     end
-    # If sampling_mode is full, we do not need to overwrite the the top environments as they are already computed accurately
-    overwrite = !(sampling_mode == :full)
+    # If sampling_mode is full, we do not need to overwrite the the top environments as they are already computed accurately.
+    # slow_energy: disable env reuse — recompute both halves from scratch and split at the fixed cut, so logψ (→ importance
+    # weights) matches the energy's fresh-env evaluation and the estimator stays variational.
+    env_kwargs = slow_energy ? (; pos=slow_energy_pos, overwrite=true) : (; overwrite=!(sampling_mode == :full))
 
-    logψ, env_top, env_down, max_bond = @timeit timer "vertical_envs" get_logψ_and_envs(peps, S, env_top; overwrite) # compute the environments of the peps according to that sample
+    logψ, env_top, env_down, max_bond = @timeit timer "vertical_envs" get_logψ_and_envs(peps, S, env_top; env_kwargs...) # compute the environments of the peps according to that sample
     h_envs_r, h_envs_l = @timeit timer "horizontal_envs" get_all_horizontal_envs(peps, env_top, env_down, S) # computes the horizontal environments of the already sampled peps
-    
+
     # initialize the flipped logψ dictionary, will be used to compute other observables or for the resampling
     logψ_flipped = Dict{Any, Number}()
     Ek_terms = @timeit timer "precomp_sHψ_elems"  QuantumNaturalGradient.get_precomp_sOψ_elems(ham_op, S; get_flip_sites=true)
@@ -23,10 +26,11 @@ function Ok_and_Ek(peps::AbstractPEPS, ham_op; trial_state::AbstractTrialState=I
 
     # add logψ from trial state such that we get the correct logψ_combined
     logψ += log(get_amplitude(trial_state, collect(vec(S))))
-    E_loc = @timeit timer "energy" get_Ek(peps, ham_op, env_top, env_down, S, logψ; trial_state=trial_state, h_envs_r, h_envs_l, logψ_flipped, Ek_terms, timer) # compute the local energy
+    E_loc = @timeit timer "energy" get_Ek(peps, ham_op, env_top, env_down, S, logψ; trial_state=trial_state, h_envs_r, h_envs_l, logψ_flipped, Ek_terms, timer, slow_energy, pos=slow_energy_pos) # compute the local energy
 
     if resample # adjust logpc, this will introduce errors as this is only an approximation of the true logpc
         @assert !correct_sampling_error "Correcting the sampling error with resampling is not implemented"
+        @assert !slow_energy "resample is not implemented together with slow_energy"
         logpc = QuantumNaturalGradient.get_logprob_resample(S, Ek_terms, logψ_flipped, ham_op; resample_energy)
     end
 
@@ -40,10 +44,10 @@ end
 """
 Calculates logψ and the environments of a given peps and sample
 """
-function get_logψ_function(peps; kwargs...)
+function get_logψ_function(peps; trial_state::AbstractTrialState=IdentityState(dim(siteinds(peps)[1])), kwargs...)
     function logψ_func(sample)
         logψ, = get_logψ_and_envs(peps, sample; kwargs...)
-        return logψ
+        return logψ + log(get_amplitude(trial_state, collect(vec(sample))))
     end
     return logψ_func
 end

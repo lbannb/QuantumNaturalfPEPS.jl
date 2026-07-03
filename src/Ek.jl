@@ -350,7 +350,14 @@ function get_Ek(peps::AbstractPEPS, ham_op::TensorOperatorSum, sample; env_top=A
 end
 
 
-function get_Ek(peps::AbstractPEPS, ham_op::TensorOperatorSum, env_top::Vector{Environment}, env_down::Vector{Environment}, sample::Matrix{Int64}, logψ::Number; trial_state=IdentityState(dim(siteinds(peps)[1])), h_envs_r=nothing, h_envs_l=nothing, fourb_envs_r=nothing, fourb_envs_l=nothing, logψ_flipped=nothing, Ek_terms=nothing, kwargs...)
+function get_Ek(peps::AbstractPEPS, ham_op::TensorOperatorSum, env_top::Vector{Environment}, env_down::Vector{Environment}, sample::Matrix{Int64}, logψ::Number; trial_state=IdentityState(dim(siteinds(peps)[1])), h_envs_r=nothing, h_envs_l=nothing, fourb_envs_r=nothing, fourb_envs_l=nothing, logψ_flipped=nothing, Ek_terms=nothing, slow_energy=false, pos=(size(peps, 1)-1) ÷ 2, kwargs...)
+    if slow_energy
+        # fixed-cut logic: recompute logψ from scratch at the same row cut for every flipped sample,
+        # exact for arbitrary interaction range instead of relying on the local flip-term environments
+        func = get_logψ_function(peps; pos, trial_state)
+        return convert_if_real(QuantumNaturalGradient.get_Ek(sample, ham_op, func))
+    end
+
     if Ek_terms === nothing
         Ek_terms = QuantumNaturalGradient.get_precomp_sOψ_elems(ham_op, sample; get_flip_sites=true)
     end
