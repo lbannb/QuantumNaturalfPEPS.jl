@@ -14,6 +14,7 @@ end
 
 function generate_Oks_and_Eks(peps::AbstractPEPS, ham_op::TensorOperatorSum; trial_state::AbstractTrialState=IdentityState(dim(siteinds(peps)[1])),
                               threaded=false, multiproc=false, shared_array=true, async_double_layers=false, verbose=false,
+                              slow_energy=false, slow_energy_interval::Integer=1,
                               kwargs...)
     
     local double_layer_update, stop_thread
@@ -35,6 +36,17 @@ function generate_Oks_and_Eks(peps::AbstractPEPS, ham_op::TensorOperatorSum; tri
         Oks_and_Eks_func = generate_Oks_and_Eks_threaded(peps, ham_op; trial_state=trial_state, double_layer_update, kwargs...)
     else
         Oks_and_Eks_func = generate_Oks_and_Eks_singlethread(peps, ham_op; trial_state=trial_state, double_layer_update, kwargs...)
+    end
+
+    if slow_energy
+        @assert slow_energy_interval >= 1 "slow_energy_interval must be >= 1"
+        inner_func = Oks_and_Eks_func
+        n_calls = Ref(0)
+        # calls 1, 1+interval, 1+2*interval, ... use the deterministic cut, all others the fast path
+        Oks_and_Eks_func = function (args...; kwargs2...)
+            n_calls[] += 1
+            return inner_func(args...; slow_energy=((n_calls[] - 1) % slow_energy_interval == 0), kwargs2...)
+        end
     end
 
     if async_double_layers
