@@ -59,10 +59,10 @@ function generate_Oks_and_Eks(peps::AbstractPEPS, ham_op::TensorOperatorSum;
         @assert slow_energy_interval >= 1 "slow_energy_interval must be >= 1"
         inner_func = Oks_and_Eks_func
         n_calls = Ref(0)
-        # calls 1, 1+interval, 1+2*interval, ... use the deterministic cut, all others the fast path
+        # calls interval, 2*interval, 3*interval, ... use the deterministic cut, all others the fast path
         Oks_and_Eks_func = function (args...; kwargs2...)
             n_calls[] += 1
-            return inner_func(args...; slow_energy=((n_calls[] - 1) % slow_energy_interval == 0), kwargs2...)
+            return inner_func(args...; slow_energy=(n_calls[] % slow_energy_interval == 0), kwargs2...)
         end
     end
 
