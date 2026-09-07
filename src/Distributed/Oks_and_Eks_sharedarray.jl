@@ -189,4 +189,3 @@ function Oks_and_Eks_multiproc_sharedarrays(GS::GaussianState, H_BdG_exact::Herm
     return Dict(:Oks => transpose(Oks), :Eks => Eks, :logψs => logψs,
                 :samples => samples, :weights => weights, :contract_dims => contract_dims)
 end
-
