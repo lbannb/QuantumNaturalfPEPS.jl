@@ -28,7 +28,8 @@ function Ok_and_Ek(peps::AbstractPEPS, ham_op; trial_state::AbstractTrialState=I
     grad = @timeit timer "log_gradients" get_Ok(peps, env_top, env_down, S, logψ; trial_state=trial_state, h_envs_r, h_envs_l, Ok) # compute the gradient
 
     # add logψ from trial state such that we get the correct logψ_combined
-    logψ += log(get_amplitude(trial_state, collect(vec(S))))
+    trial_amplitudes = @timeit timer "trial_amplitudes" trial_amplitude_cache(trial_state, S)
+    logψ += log(get_amplitude(trial_amplitudes, collect(vec(S))))
 
     local Ek_terms, E_loc
     if slow_energy
@@ -37,7 +38,7 @@ function Ok_and_Ek(peps::AbstractPEPS, ham_op; trial_state::AbstractTrialState=I
         E_loc = @timeit timer "energy_slow" convert_if_real(QuantumNaturalGradient.get_Ek(S, ham_op, func))
     else
         Ek_terms = @timeit timer "precomp_sHψ_elems"  QuantumNaturalGradient.get_precomp_sOψ_elems(ham_op, S; get_flip_sites=true)
-        E_loc = @timeit timer "energy" get_Ek(peps, ham_op, env_top, env_down, S, logψ; trial_state=trial_state, h_envs_r, h_envs_l, logψ_flipped, Ek_terms, timer) # compute the local energy
+        E_loc = @timeit timer "energy" get_Ek(peps, ham_op, env_top, env_down, S, logψ; trial_state=trial_state, h_envs_r, h_envs_l, logψ_flipped, Ek_terms, trial_amplitudes, timer) # compute the local energy
     end
 
     if resample # adjust logpc, this will introduce errors as this is only an approximation of the true logpc

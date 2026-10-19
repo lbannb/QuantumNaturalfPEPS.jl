@@ -314,12 +314,16 @@ function get_logψ_flipped(peps::AbstractPEPS, Ek_terms, env_top::Vector{Environ
                           sample::Matrix{Int64}, logψ::Number;
                           trial_state::AbstractTrialState=IdentityState(dim(siteinds(peps)[1])),
                           h_envs_r=nothing, h_envs_l=nothing, fourb_envs_r=nothing, fourb_envs_l=nothing, logψ_flipped=nothing,
-                          timer=TimerOutput())
-    
+                          trial_amplitudes=nothing, timer=TimerOutput())
+
     if logψ_flipped === nothing
         logψ_flipped = Dict{Any, Number}()
     end
-      
+    # amplitudes of the trial state for the flipped samples (low-rank updates from `sample` for a Gaussian state)
+    if trial_amplitudes === nothing
+        trial_amplitudes = trial_amplitude_cache(trial_state, sample)
+    end
+
     # deals with the term with no flipped spin
     if haskey(Ek_terms, ())
         logψ_flipped[()] = logψ
@@ -343,7 +347,7 @@ function get_logψ_flipped(peps::AbstractPEPS, Ek_terms, env_top::Vector{Environ
                 sample_flipped[x, y] = Sij
             end
 
-            logψ_flipped[flip_term] += log(get_amplitude(trial_state, collect(vec(sample_flipped))))
+            logψ_flipped[flip_term] += log(get_amplitude(trial_amplitudes, collect(vec(sample_flipped))))
         end
     end
     
@@ -362,7 +366,7 @@ function get_logψ_flipped(peps::AbstractPEPS, Ek_terms, env_top::Vector{Environ
                 for ((x, y), Sij) in flip_term
                     sample_flipped[x, y] = Sij
                 end
-                logψ_flipped[flip_term] += log(get_amplitude(trial_state, collect(vec(sample_flipped))))
+                logψ_flipped[flip_term] += log(get_amplitude(trial_amplitudes, collect(vec(sample_flipped))))
             end
         end
     end
@@ -419,7 +423,7 @@ function get_logψ_flipped(peps::AbstractPEPS, Ek_terms, env_top::Vector{Environ
                     sample_flipped[row, column] = value
                 end
                 logψ_flipped[flip_term] +=
-                    log(get_amplitude(trial_state, collect(vec(sample_flipped))))
+                    log(get_amplitude(trial_amplitudes, collect(vec(sample_flipped))))
             end
         end
     end
@@ -436,7 +440,7 @@ function get_logψ_flipped(peps::AbstractPEPS, Ek_terms, env_top::Vector{Environ
                 for ((x, y), Sij) in flip_term
                     sample_flipped[x, y] = Sij
                 end
-                logψ_flipped[flip_term] += log(get_amplitude(trial_state, collect(vec(sample_flipped))))
+                logψ_flipped[flip_term] += log(get_amplitude(trial_amplitudes, collect(vec(sample_flipped))))
             end
         end
     end
@@ -456,7 +460,7 @@ function get_logψ_flipped(peps::AbstractPEPS, Ek_terms, env_top::Vector{Environ
                     sample_flipped[x,y] = Sij
                 end
                 logψ_flipped[flip_term] = logψ_exact(peps, sample_flipped)
-                logψ_flipped[flip_term] += log(get_amplitude(trial_state, collect(vec(sample_flipped))))
+                logψ_flipped[flip_term] += log(get_amplitude(trial_amplitudes, collect(vec(sample_flipped))))
             end
         end
     end

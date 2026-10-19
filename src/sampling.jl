@@ -147,6 +147,15 @@ function sample_ρr(
                 "$(first(trial_sampling_cache.remaining_sites)), got $current_site_key",
             ))
         p_trial .= projected_conditional_probabilities(trial_sampling_cache; lookahead_depth)
+    elseif trial_sampling_cache isa GaussianSchurSamplingCache
+        k == 2 || throw(DimensionMismatch(
+            "Gaussian occupation sampling requires local dimension 2, got $k",
+        ))
+        next_site(trial_sampling_cache) == current_site_key || throw(ArgumentError(
+            "Gaussian Schur cache expects site $(next_site(trial_sampling_cache)), got $current_site_key",
+        ))
+        # conditional instead of joint probabilities: the same weights up to the common factor P(s_<)
+        p_trial .= gaussian_conditional_probabilities(trial_sampling_cache)
     else
         occ_dict = Dict{Int, Int}()
         for i in 1:size(S, 1), j in 1:size(S, 2)
@@ -165,11 +174,16 @@ function sample_ρr(
     i = sample_p(p_final, normalize=true)
     if trial_sampling_cache isa ProjectedGaussianSchurCache
         condition_projected_gaussian!(trial_sampling_cache, i - 1)
+    elseif trial_sampling_cache isa GaussianSchurSamplingCache
+        condition_gaussian!(trial_sampling_cache, i - 1)
     end
     return i-1, p_final[i]
 end
 
 _direct_sampling_cache(::AbstractTrialState, _) = nothing
+# one mode per PEPS site; parton states with several flavours per site keep the get_prob path
+_direct_sampling_cache(state::GaussianState, order) =
+    state.n_flavours == 1 && length(order) == state.N ? GaussianSchurSamplingCache(state; order) : nothing
 _direct_sampling_cache(state::AbstractGutzwillerProjectedState, order) =
     ProjectedGaussianSchurCache(state; order)
 _direct_sampling_cache(state::FrozenTrialState, order) =
@@ -304,23 +318,26 @@ function sample_ρr(GS::GaussianState, S, r, c, M_cache::OccupationProjectorCach
     return i-1, p_final[i]
 end
 
-# generates a sample of a given peps along with pc and the top environments
+# generates a sample of a Gaussian state along with pc (sites in row-major order, conditional probabilities from GaussianSchurSamplingCache)
 function get_sample(GS::GaussianState; timer=TimerOutput())
     L = Int(sqrt(GS.N)) # TODO: this only works for square lattices, we should make this more general
 
     S = Array{Int64}(undef, L, L)
-    M_cache = OccupationProjectorCache(GS.N)
-    
+    cache = GaussianSchurSamplingCache(GS; order=[col_major_site(i, j, L) for i in 1:L for j in 1:L])
+
     logpc = 0
     # we loop through every row
     for i in 1:L
         # then we loop through the different sites in one row
         for j in 1:L
             # sample from Slater wave function
-            S[i, j], pc = sample_ρr(GS, S, i, j, M_cache)
-            logpc += log(pc)
+            p_final = gaussian_conditional_probabilities(cache)
+            k = sample_p(p_final, normalize=true)
+            condition_gaussian!(cache, k - 1)
+            S[i, j] = k - 1
+            logpc += log(p_final[k])
         end
     end
-    
+
     return S, logpc
 end

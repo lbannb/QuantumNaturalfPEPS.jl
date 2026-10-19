@@ -40,5 +40,10 @@ get_amplitude(state::FrozenTrialState, args...) = get_amplitude(state.state, arg
 Parameters(::FrozenTrialState) = []
 Base.eltype(state::FrozenTrialState) = eltype(state.state)
 
+# Evaluates the trial-state amplitudes of configurations close to `sample` (the flipped configurations of a
+# local energy) with `get_amplitude`. States without a dedicated cache return themselves.
+trial_amplitude_cache(state::AbstractTrialState, sample) = state
+trial_amplitude_cache(state::FrozenTrialState, sample) = trial_amplitude_cache(state.state, sample)
+
 include("GaussianState.jl")
 include("GutzwillerProjectedState.jl")

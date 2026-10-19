@@ -127,3 +127,95 @@ end
         @test mod(sum(configuration), 2) == state.parity_sector
     end
 end
+
+@testset "Gaussian per-sample caches against the direct formulas" begin
+    QNfP = QuantumNaturalfPEPS
+    L = 4
+    N = L^2
+    rng = Xoshiro(1507)
+    η = randn(rng, QNfP.get_max_num_MF_params_NN(L, L))
+    order = [QNfP.col_major_site(i, j, L) for i in 1:L for j in 1:L]
+
+    for parity_sector in (0, 1)
+        GS = QNfP.GaussianState(QNfP.build_general_H_BdG_2D_NN, N; η, parity_sector)
+
+        @testset "Schur sampling cache: conditional probabilities (parity $parity_sector)" begin
+            cache = QNfP.GaussianSchurSamplingCache(GS; order)
+            prefix = Dict{Int,Int}()
+            for site in order
+                p = QNfP.gaussian_conditional_probabilities(cache)
+                joint = map(0:1) do n
+                    candidate = copy(prefix)
+                    candidate[site] = n
+                    QNfP.get_prob(GS, candidate)
+                end
+                @test sum(p) ≈ 1 atol=1e-12
+                @test p ./ sum(p) ≈ joint ./ sum(joint) atol=1e-12
+                n = p[1] > 1e-6 && (p[2] <= 1e-6 || rand(rng) < 0.5) ? 0 : 1
+                prefix[site] = n
+                QNfP.condition_gaussian!(cache, n)
+            end
+            @test mod(sum(values(prefix)), 2) == parity_sector
+        end
+
+        @testset "sparse ∂H in the Majorana basis (parity $parity_sector)" begin
+            c = GS.loggrad_cache
+            for (i, dH) in enumerate(QNfP.build_H_BdG_derivatives(GS.H_BdG_func, GS.η, GS.N))
+                dense = QNfP.transform_H_to_majorana_qq(Matrix(dH))
+                from_entries = zeros(size(dense))
+                for p in c.dH_ptr[i]:c.dH_ptr[i+1]-1
+                    from_entries[c.dH_rows[p], c.dH_cols[p]] += c.dH_vals[p]
+                end
+                @test from_entries ≈ dense atol=1e-14
+            end
+        end
+
+        @testset "log-derivatives against the dense ∂ηΓ (parity $parity_sector)" begin
+            dΓs = QNfP.build_slater_loggradient_cache(GS).dΓs
+            for _ in 1:5
+                S, _ = QNfP.get_sample(GS)
+                Ok = QNfP.get_Ok(GS, S, zeros(length(η)))
+                F = 2 .* GS.Γ .+ QNfP.build_occ_projector_matrix(QNfP.to_occ_dict(collect(vec(S))), N)
+                Ok_dense = [real(0.25 * tr(F \ dΓ)) for dΓ in dΓs]
+                @test maximum(abs, Ok .- Ok_dense) <= 1e-10 * max(1, maximum(abs, Ok_dense))
+            end
+        end
+
+        @testset "flipped amplitudes against the full Pfaffian (parity $parity_sector)" begin
+            for _ in 1:5
+                S, _ = QNfP.get_sample(GS)
+                reference = collect(vec(S))
+                amplitude = QNfP.get_amplitude(GS, reference)
+                flips = QNfP.trial_amplitude_cache(GS, S)
+                @test flips isa QNfP.GaussianFlipAmplitudeCache
+                @test QNfP.get_amplitude(flips, reference) == amplitude
+                # one to five changed sites: hops, pair creation/annihilation, odd changes (zero), full-Pfaffian fallback
+                for _ in 1:100
+                    sites = randperm(rng, N)[1:rand(rng, 1:5)]
+                    flipped = copy(reference)
+                    flipped[sites] .= 1 .- flipped[sites]
+                    @test isapprox(QNfP.get_amplitude(flips, flipped), QNfP.get_amplitude(GS, flipped);
+                                   atol=1e-10 * abs(amplitude))
+                end
+            end
+        end
+
+        @testset "joint sampler uses the Schur cache (parity $parity_sector)" begin
+            @test QNfP._direct_sampling_cache(GS, order) isa QNfP.GaussianSchurSamplingCache
+            @test QNfP._direct_sampling_cache(QNfP.FrozenTrialState(GS), order) isa QNfP.GaussianSchurSamplingCache
+            # a uniform product PEPS leaves the Gaussian weights unchanged: same draws as get_sample(GS)
+            hilbert = siteinds("S=1/2", L, L)
+            peps = PEPS(Float64, hilbert; bond_dim=1, show_warning=false)
+            write!(peps, fill(inv(sqrt(2)), length(peps)))
+            for seed in 1:3
+                Random.seed!(seed)
+                S_joint, logpc_joint, _ = QNfP.get_sample(peps; trial_state=GS)
+                Random.seed!(seed)
+                S_gaussian, logpc_gaussian = QNfP.get_sample(GS)
+                @test S_joint == S_gaussian
+                @test logpc_joint ≈ logpc_gaussian atol=1e-10
+                @test exp(logpc_gaussian) ≈ QNfP.get_prob(GS, collect(vec(S_gaussian))) rtol=1e-8
+            end
+        end
+    end
+end

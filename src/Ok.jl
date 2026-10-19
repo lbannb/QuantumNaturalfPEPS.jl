@@ -103,63 +103,45 @@ Oⱼ,ᵢ(η) = ∂η ln(Sⱼ(η)) = 0.25 * Tr[Fⱼ⁻¹(η) ∂ηᵢ Γ(η)]
 
 where `Fⱼ = Mⱼ - Γ⁻¹` and `Mⱼ` is the matrix for the occupation projector to the configuration `j`.
 
+Both cases are `Oⱼ,ᵢ = 0.25 * Tr[G ∂ηᵢΓ]` with `G = Fⱼ⁻¹` or `G = Γ⁻¹ Fⱼ⁻¹ Γ⁻¹`. The traces of all parameters are
+evaluated together from the `GaussianLogGradientCache` of the state, without the dense `∂ηᵢΓ`.
+
 """
 function get_Ok(trial_state::GaussianState, S::Matrix{Int64}, Ok)
-    trial_state.cache_gradients || throw(ArgumentError(
-        "Gaussian covariance-gradient caching is disabled for this state; " *
-        "construct it with cache_gradients=true on a system small enough for " *
-        "the dense gradient cache",
+    cache = trial_state.loggrad_cache
+    cache === nothing && throw(ArgumentError(
+        "the Gaussian log-gradient data is disabled for this state; " *
+        "construct it with cache_gradients=true",
     ))
     η_idx = size(Ok, 1) - length(trial_state.η) # start index for the variational parameters of the trial state
     occ_string = collect(vec(S))
     N = length(occ_string)
 
-    slater_loggrad_cache = trial_state.slater_loggrad_cache
     Γ = trial_state.Γ
-
-    is_pure = Γ * Γ ≈ -I/4
 
     # Build matrix M_j to occupation projector to configuration S_j
     M_j = build_occ_projector_matrix(to_occ_dict(occ_string), N)
 
-    F_j = begin
-        tmp = similar(Γ)
-        # factor of 2 is needed as in our convention we have Γ² = -I/4
-        if is_pure # Fⱼ = Mⱼ + Γ
-            tmp .= 2*Γ
-            tmp .+= M_j
-        else # Fⱼ = Mⱼ - Γ⁻¹
-            tmp .= M_j
-            tmp .-= inv(2*Γ)
-        end
-        tmp
+    F_j = similar(Γ)
+    # factor of 2 is needed as in our convention we have Γ² = -I/4
+    if cache.is_pure # Fⱼ = Mⱼ + Γ, G = Fⱼ⁻¹
+        F_j .= 2*Γ
+        F_j .+= M_j
+        G = inv(lu!(F_j; check=false))
+    else # Fⱼ = Mⱼ - Γ⁻¹, G = Γ⁻¹ Fⱼ⁻¹ Γ⁻¹
+        F_j .= M_j
+        F_j .-= inv(2*Γ)
+        G = cache.Γinv * inv(lu!(F_j; check=false)) * cache.Γinv
     end
 
-    # check=false for speedup as it doesnt check for singularities then
-    F_fac = lu!(F_j; check=false)
-    invΓ = is_pure ? nothing : inv(lu!(copy(Γ); check=false))
-
-    X = similar(slater_loggrad_cache.dΓs[1])
+    # Tr(G ∂ηᵢΓ) = Σ_kl Y[l,k] (∂ηᵢH_maj)[k,l], summed over the nonzero entries of ∂ηᵢH_maj
+    Y = loggradient_weights(cache, Γ, G)
     for i in eachindex(trial_state.η)
-        dΓ = slater_loggrad_cache.dΓs[i] # ∂ηᵢ Γ
-
-        if is_pure
-            # =========================================================================
-            # O_k = 0.25 * Tr(F_j⁻¹ dΓ_k )
-            # =========================================================================
-
-            # Solve: F_j X = dΓ, so X = F_j⁻¹ dΓ
-            ldiv!(X, F_fac, dΓ)
-            Ok[η_idx + i] = real(0.25 * tr(X))
-        else
-            # =========================================================================
-            # O_k = 0.25 * Tr(F_j⁻¹ Γ⁻¹ dΓ_k Γ⁻¹)
-            # =========================================================================
-
-            # solve F_j X = Y, with Y = Γ⁻¹ * dΓ * Γ⁻¹
-            ldiv!(X, F_fac, invΓ * dΓ * invΓ)
-            Ok[η_idx + i] = real(0.25 * tr(X))
+        trace = zero(ComplexF64)
+        @inbounds for p in cache.dH_ptr[i]:cache.dH_ptr[i+1]-1
+            trace += Y[cache.dH_cols[p], cache.dH_rows[p]] * cache.dH_vals[p]
         end
+        Ok[η_idx + i] = real(0.25 * trace)
     end
 
     return Ok

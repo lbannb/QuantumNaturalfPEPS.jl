@@ -31,6 +31,39 @@ struct SlaterLogGradientCache
 end
 
 """
+    GaussianLogGradientCache
+
+Data for the log-derivatives `Oⱼ,ᵢ = 0.25 Tr(G ∂ηᵢΓ)` of the amplitudes (see `get_Ok`) without the dense
+`∂ηᵢΓ` of `SlaterLogGradientCache` (one 2N×2N matrix per parameter).
+
+`∂ηᵢΓ` solves `[H_maj, ∂ηᵢΓ] = -[∂ηᵢH_maj, Γ]`, i.e. `∂ηᵢΓ = Uh ((Uh' Cᵢ Uh) .* invden) Uh'` with
+`Cᵢ = [∂ηᵢH_maj, Γ]` (see `build_slater_loggradient_cache`). This map is linear in `∂ηᵢH_maj`, so its adjoint
+moves the sample-dependent `G` to the other side once per sample:
+```
+    Tr(G ∂ηᵢΓ) = Σ_kl Y[l,k] (∂ηᵢH_maj)[k,l],   Y = Γ V - V Γ,   V = Uh transpose(transpose(Uh' G Uh) .* invden) Uh'
+```
+which costs a few O(N³) products per sample plus a sum over the few nonzero entries of each `∂ηᵢH_maj`,
+instead of one O(N³) solve per parameter.
+
+# Fields
+- `Uh::Matrix{ComplexF64}`, `invden::Matrix{ComplexF64}`: eigenvectors of `i·H_maj` and the inverse eigenvalue differences, zero on degenerate pairs (as in `build_slater_loggradient_cache`)
+- `dH_ptr::Vector{Int}`, `dH_rows::Vector{Int}`, `dH_cols::Vector{Int}`, `dH_vals::Vector{Float64}`: the nonzero entries of `∂ηᵢH_maj`, those of parameter `i` at `dH_ptr[i]:dH_ptr[i+1]-1`
+- `is_pure::Bool`: whether `Γ² = -I/4`
+- `Γinv::Union{Nothing,Matrix{ComplexF64}}`: `Γ⁻¹` of a mixed state (`nothing` for a pure one)
+
+"""
+struct GaussianLogGradientCache
+    Uh::Matrix{ComplexF64}
+    invden::Matrix{ComplexF64}
+    dH_ptr::Vector{Int}
+    dH_rows::Vector{Int}
+    dH_cols::Vector{Int}
+    dH_vals::Vector{Float64}
+    is_pure::Bool
+    Γinv::Union{Nothing,Matrix{ComplexF64}}
+end
+
+"""
     SlaterConnection
 
 A struct to store the connection information for the nonzero matrix elements of a quadratic Hamiltonian in the occupation number basis.
@@ -73,7 +106,7 @@ The struct also includes the variational parameters η used to construct H_BdG.
 - `parity_sector::Int`: The parity sector of the state, which can be either 0 (even) or 1 (odd).
 - `occ_ref::Vector{Int}`: The quasiparticle occupation reference, which is important for selecting the correct Bogoliubov vacuum in the Bloch-Messiah decomposition.
                         It is constructed from the combination of the `parity_sector` and the `target_state`.
-- `slater_loggrad_cache::SlaterLogGradientCache`: A cache for efficient gradient calculations in Slater determinant states, which stores the A matrix and its derivatives with respect to the variational parameters.
+- `loggrad_cache::Union{Nothing,GaussianLogGradientCache}`: The data for the log-derivatives of the amplitudes with respect to the variational parameters (`nothing` if `cache_gradients=false`).
 
 """
 mutable struct GaussianState <: AbstractTrialState
@@ -86,8 +119,8 @@ mutable struct GaussianState <: AbstractTrialState
     target_Sz::Union{Nothing,Real} # total magnetization sector, or nothing for unconstrained filling
     n_flavours::Int # interleaved parton flavours per physical site
     occ_ref::Vector{Int} # quasiparticle occupation reference. Important for selecting the correct Bogoliubov vacuum in Bloch-Messiah decomposition.
-    cache_gradients::Bool # whether dense covariance derivatives are cached for variational optimization
-    slater_loggrad_cache::SlaterLogGradientCache # Cache for efficient gradient calculations in Slater determinant states
+    cache_gradients::Bool # whether the log-gradient data is built for variational optimization
+    loggrad_cache::Union{Nothing,GaussianLogGradientCache} # data for the log-derivatives Ok of the amplitudes
     amplitude_cache::GaussianAmplitudeCache # Cache for efficient amplitude calculations
 
     function GaussianState(
@@ -117,15 +150,8 @@ mutable struct GaussianState <: AbstractTrialState
             target_Sz,
             n_flavours,
         )
-        slater_loggrad_cache = cache_gradients ? build_slater_loggradient_cache(
-            H_BdG_func,
-            η,
-            N;
-            parity_sector,
-            target_state,
-            target_Sz,
-            n_flavours,
-        ) : SlaterLogGradientCache(Matrix{ComplexF64}[])
+        loggrad_cache = cache_gradients ?
+            build_gaussian_loggradient_cache(H_BdG_func, η, N, H_BdG, Γ) : nothing
         amplitude_cache = build_amplitude_cache(
             H_BdG,
             parity_sector,
@@ -143,7 +169,7 @@ mutable struct GaussianState <: AbstractTrialState
             n_flavours,
             occ_ref,
             cache_gradients,
-            slater_loggrad_cache,
+            loggrad_cache,
             amplitude_cache,
         )
     end
@@ -260,7 +286,7 @@ Base.eltype(::GaussianState) = ComplexF64
 """
     write!(GS::GaussianState, η::AbstractVector{<:Number})
 
-Updates the variational parameters `η` of the Gaussian state `GS` and recompute the covariance matrix `Γ` and the Slater log-gradient cache accordingly.
+Updates the variational parameters `η` of the Gaussian state `GS` and recompute the covariance matrix `Γ` and the log-gradient data accordingly.
 
 """
 function write!(GS::GaussianState, η::AbstractVector{<:Number})
@@ -273,15 +299,8 @@ function write!(GS::GaussianState, η::AbstractVector{<:Number})
         target_Sz=GS.target_Sz,
         n_flavours=GS.n_flavours,
     )
-    GS.slater_loggrad_cache = GS.cache_gradients ? build_slater_loggradient_cache(
-        GS.H_BdG_func,
-        η,
-        GS.N;
-        parity_sector=GS.parity_sector,
-        target_state=GS.target_state,
-        target_Sz=GS.target_Sz,
-        n_flavours=GS.n_flavours,
-    ) : SlaterLogGradientCache(Matrix{ComplexF64}[])
+    GS.loggrad_cache = GS.cache_gradients ?
+        build_gaussian_loggradient_cache(GS.H_BdG_func, η, GS.N, H_BdG, GS.Γ) : nothing
     GS.amplitude_cache = build_amplitude_cache(
         H_BdG,
         GS.parity_sector,
@@ -648,6 +667,102 @@ function get_prob!(GS::GaussianState, M_cache::OccupationProjectorCache, n_measu
 end
 
 """
+    GaussianSchurSamplingCache(GS::GaussianState; order=1:GS.N)
+
+Direct-sampling cache for the occupations of a Gaussian state, measured one site at a time in `order`
+(the counterpart of `ProjectedGaussianSchurCache` for Gutzwiller-projected states).
+
+With `det(2Γ_AA M_AA - I) = det(2Γ_AA + M_AA)`, the joint probability of `get_prob` for the measured sites `A`
+is `P(s_A) = sqrt|det(Γ_AA + M_AA/2)|`. By the Schur complement, the next site `t` has the conditional probability
+```
+    P(n_t | s_A) = sqrt|det(Γᶜ_tt + M_t/2)|,   Γᶜ = Γ_RR - Γ_RA (Γ_AA + M_AA/2)⁻¹ Γ_AR,
+```
+where `Γᶜ` is the covariance matrix of the unmeasured modes `R` conditioned on `s_A`. Fixing `n_t` is a rank-2
+update of `Γᶜ`, O(N²) per site instead of a 2N×2N determinant per site and outcome. The conditional probabilities
+differ from the joint ones of `get_prob` only by the common factor `P(s_A)`, so the normalized sampling weights
+are the same.
+"""
+mutable struct GaussianSchurSamplingCache
+    covariance::Matrix{ComplexF64} # modes in sampling order; the unmeasured block is conditioned on the measured sites
+    sites::Vector{Int}             # sampling order
+    measured::Int                  # number of sites measured so far
+end
+
+function GaussianSchurSamplingCache(
+    GS::GaussianState;
+    order::AbstractVector{<:Integer}=collect(1:GS.N),
+)
+    sites = collect(Int, order)
+    sort(sites) == collect(1:GS.N) || throw(ArgumentError(
+        "sampling order must be a permutation of 1:$(GS.N)",
+    ))
+    modes = Vector{Int}(undef, 2length(sites))
+    for (position, site) in enumerate(sites)
+        modes[2position - 1] = 2site - 1
+        modes[2position] = 2site
+    end
+    return GaussianSchurSamplingCache(Matrix{ComplexF64}(GS.Γ[modes, modes]), sites, 0)
+end
+
+next_site(cache::GaussianSchurSamplingCache) = cache.sites[cache.measured + 1]
+
+# Γᶜ_tt + M_t/2 of the next site t for the occupation n, as (k11, k12, k21, k22)
+function _conditional_block(cache::GaussianSchurSamplingCache, n::Integer)
+    a = 2cache.measured + 1
+    b = a + 1
+    s_j = 1 - 2n
+    Γ = cache.covariance
+    return Γ[a, a], Γ[a, b] + s_j / 2, Γ[b, a] - s_j / 2, Γ[b, b]
+end
+
+"""
+    gaussian_conditional_probabilities(cache::GaussianSchurSamplingCache)
+
+The conditional probabilities `[P(0 | s_A), P(1 | s_A)]` of the next site of `cache`.
+"""
+function gaussian_conditional_probabilities(cache::GaussianSchurSamplingCache)
+    cache.measured < length(cache.sites) || throw(ArgumentError("all sites have already been measured"))
+    return map(0:1) do n
+        k11, k12, k21, k22 = _conditional_block(cache, n)
+        sqrt(abs(k11 * k22 - k12 * k21))
+    end
+end
+
+"""
+    condition_gaussian!(cache::GaussianSchurSamplingCache, n)
+
+Fixes the occupation `n` of the next site of `cache` (Schur complement of its 2×2 block).
+"""
+function condition_gaussian!(cache::GaussianSchurSamplingCache, n::Integer)
+    n in (0, 1) || throw(ArgumentError("occupation must be 0 or 1, got $n"))
+    cache.measured < length(cache.sites) || throw(ArgumentError("all sites have already been measured"))
+    k11, k12, k21, k22 = _conditional_block(cache, n)
+    det_K = k11 * k22 - k12 * k21
+    iszero(det_K) && throw(ArgumentError("cannot condition on an occupation of zero probability"))
+
+    Γ = cache.covariance
+    a = 2cache.measured + 1
+    b = a + 1
+    dim = size(Γ, 1)
+    # Γᶜ_RR -= Γᶜ_Rt K⁻¹ Γᶜ_tR  with  K⁻¹ = [k22 -k12; -k21 k11] / det K
+    @inbounds for c in b+1:dim
+        x1 = (k22 * Γ[a, c] - k12 * Γ[b, c]) / det_K
+        x2 = (k11 * Γ[b, c] - k21 * Γ[a, c]) / det_K
+        for r in b+1:dim
+            Γ[r, c] -= Γ[r, a] * x1 + Γ[r, b] * x2
+        end
+    end
+    # keep the conditioned covariance matrix exactly antisymmetric, so rounding cannot accumulate over the sites
+    @inbounds for c in b+1:dim, r in b+1:c
+        v = (Γ[r, c] - Γ[c, r]) / 2
+        Γ[r, c] = v
+        Γ[c, r] = -v
+    end
+    cache.measured += 1
+    return cache
+end
+
+"""
     build_occ_projector_matrix(occ_dict::Dict{Int, Int}, N::Int)
 
 Builds the matrix M for the occupation projector `P_j(θ) ∼ exp(i/2 θᵀ M θ)`, where `M` is a block-diagonal matrix with 2x2 blocks corresponding to the sites in `occ_dict`. Each block is defined as:
@@ -740,6 +855,140 @@ end
 function get_amplitude(GS::GaussianState, occ_string::Vector{Int})
     return get_amplitude(GS.amplitude_cache, occ_string)
 end
+
+"""
+    GaussianFlipAmplitudeCache(cache::GaussianAmplitudeCache, occ_string; max_flips=4)
+
+Amplitudes `⟨s'|ψ⟩` of configurations `s'` that differ from the reference `s = occ_string` in a few
+occupations (the flipped configurations of a local energy), from one inverse per reference instead of one
+Pfaffian per `s'`.
+
+`get_amplitude` evaluates `⟨s|ψ⟩ = fsign(M) Pf(B[I,I]) inv_v_prod` with the fixed skew-symmetric matrix
+`B = [0 R; -Rᵀ Q]` (`R = R_mat_full`, `Q = Q_mat`), the `M` occupied sites of `s` and the index set
+`I = (occupied sites..., N+1, …, N+K)`. If `s'` empties the sites `E ⊂ I` and fills the sites `F`, then
+```
+    Pf(B[I',I']) = ± Pf(X) Pf(G),   G = [ B[F,F] + Pᵀ X⁻¹ P    -(X⁻¹P)[E,:]ᵀ
+                                          (X⁻¹P)[E,:]            (X⁻¹)[E,E]   ],   X = B[I,I],  P = B[I,F],
+```
+(Schur complement for the filled sites, the Pfaffian form of Jacobi's identity for the emptied ones), with the
+sign of the index reorderings. `G` is (|E|+|F|)×(|E|+|F|), 2×2 for a hop. Configurations with more than
+`max_flips` changed sites, and all of them if `⟨s|ψ⟩ = 0` or `X` is singular, use the full Pfaffian.
+"""
+struct GaussianFlipAmplitudeCache
+    amplitude_cache::GaussianAmplitudeCache
+    occ::Vector{Int}             # reference configuration s
+    amplitude::ComplexF64        # ⟨s|ψ⟩, exactly as get_amplitude(amplitude_cache, occ)
+    occupied_after::Vector{Int}  # number of occupied sites of s after each site
+    position::Vector{Int}        # position of each occupied site in I (0 for an empty site)
+    Xinv::Matrix{ComplexF64}     # B[I,I]⁻¹
+    XinvP::Matrix{ComplexF64}    # B[I,I]⁻¹ B[I,1:N]
+    PXinvP::Matrix{ComplexF64}   # B[1:N,1:N] + B[I,1:N]ᵀ B[I,I]⁻¹ B[I,1:N]
+    low_rank::Bool               # false: every amplitude from the full Pfaffian
+    max_flips::Int
+end
+
+function GaussianFlipAmplitudeCache(
+    cache::GaussianAmplitudeCache,
+    occ_string::AbstractVector{<:Integer};
+    max_flips::Int=4,
+)
+    occ = collect(Int, occ_string)
+    R = cache.R_mat_full
+    N, K = size(R)
+    length(occ) == N || throw(DimensionMismatch(
+        "the configuration has $(length(occ)) sites, the Gaussian state $N",
+    ))
+    amplitude = get_amplitude(cache, occ)
+    occupied = findall(==(1), occ)
+    M = length(occupied)
+    position = zeros(Int, N)
+    position[occupied] = 1:M
+    occupied_after = zeros(Int, N)
+    for x in N-1:-1:1
+        occupied_after[x] = occupied_after[x+1] + (occ[x+1] == 1)
+    end
+
+    n = M + K
+    low_rank = !iszero(amplitude) && n > 0
+    Xinv = XinvP = PXinvP = Matrix{ComplexF64}(undef, 0, 0)
+    if low_rank
+        X = zeros(ComplexF64, n, n)
+        X[1:M, M+1:n] = R[occupied, :]
+        X[M+1:n, 1:M] = -transpose(R[occupied, :])
+        X[M+1:n, M+1:n] = cache.Q_mat
+        X_fac = lu!(X; check=false)
+        if issuccess(X_fac)
+            Xinv = inv(X_fac)
+            # B[I,1:N] vanishes on the occupied sites and is -Rᵀ on the Bloch-Messiah modes; B[1:N,1:N] = 0
+            XinvP = -(Xinv[:, M+1:n] * transpose(R))
+            PXinvP = -(R * XinvP[M+1:n, :])
+        else
+            low_rank = false
+        end
+    end
+    return GaussianFlipAmplitudeCache(cache, occ, amplitude, occupied_after, position, Xinv, XinvP, PXinvP,
+                                      low_rank, max_flips)
+end
+
+function get_amplitude(flips::GaussianFlipAmplitudeCache, occ_string::AbstractVector{<:Integer})
+    occ = flips.occ
+    length(occ_string) == length(occ) || throw(DimensionMismatch(
+        "the configuration has $(length(occ_string)) sites, the reference $(length(occ))",
+    ))
+    emptied = Int[]
+    filled = Int[]
+    for x in eachindex(occ)
+        occ_string[x] == occ[x] && continue
+        occ[x] == 1 ? push!(emptied, x) : push!(filled, x)
+    end
+    k, m = length(emptied), length(filled)
+    k + m == 0 && return flips.amplitude
+    if !flips.low_rank || k + m > flips.max_flips
+        return get_amplitude(flips.amplitude_cache, collect(Int, occ_string))
+    end
+    isodd(k + m) && return zero(ComplexF64) # parity selection rule
+
+    # G in the order (filled..., emptied...), built skew-symmetric
+    d = k + m
+    G = zeros(ComplexF64, d, d)
+    position = flips.position
+    for v in 1:m, u in 1:v-1
+        G[u, v] = flips.PXinvP[filled[u], filled[v]]
+    end
+    for v in 1:k, u in 1:m
+        G[u, m + v] = -flips.XinvP[position[emptied[v]], filled[u]]
+    end
+    for v in 1:k, u in 1:v-1
+        G[m + u, m + v] = flips.Xinv[position[emptied[u]], position[emptied[v]]]
+    end
+    for c in 1:d, r in c+1:d
+        G[r, c] = -G[c, r]
+    end
+    pf = d == 2 ? G[1, 2] :
+         d == 4 ? G[1, 2] * G[3, 4] - G[1, 3] * G[2, 4] + G[1, 4] * G[2, 3] :
+         pfaffian(G)
+
+    # Sign of the reorderings: the emptied sites move behind the kept sites and the K Bloch-Messiah modes,
+    # the filled sites (appended behind the kept ones) move to their sorted positions, plus the factors
+    # (-1)^(k(k-1)/2) and (-1)^(mk) of the Pfaffian identities.
+    K = size(flips.amplitude_cache.Q_mat, 1)
+    inversions = (k * (k - 1)) ÷ 2 + m * k
+    for x in emptied
+        inversions += flips.occupied_after[x] - count(>(x), emptied) + K
+    end
+    for x in filled
+        inversions += flips.occupied_after[x] - count(>(x), emptied) + K
+    end
+    M = count(==(1), occ)
+    M_new = M - k + m
+    fsign(n) = isodd((n * (n - 1)) ÷ 2) ? -1 : 1 # fermionic sign of get_amplitude
+    sign = (isodd(inversions) ? -1 : 1) * fsign(M) * fsign(M_new)
+    return sign * pf * flips.amplitude
+end
+
+trial_amplitude_cache(GS::GaussianState, sample) =
+    length(sample) == size(GS.amplitude_cache.R_mat_full, 1) ?
+        GaussianFlipAmplitudeCache(GS.amplitude_cache, vec(sample)) : GS
 # function get_amplitude(H_BdG::Hermitian, occ_string::Vector{Int})
 #     return get_amplitude(build_amplitude_cache(H_BdG), occ_string)
 # end
@@ -924,6 +1173,108 @@ function build_slater_loggradient_cache(GS::GaussianState)
         target_Sz=GS.target_Sz,
         n_flavours=GS.n_flavours,
     )
+end
+
+"""
+    build_gaussian_loggradient_cache(H_BdG_func, η, N, H_BdG, Γ)
+
+Builds the `GaussianLogGradientCache` of the state with covariance matrix `Γ` of `H_BdG = H_BdG_func(η, N)`:
+the eigendecomposition and degeneracy mask of `build_slater_loggradient_cache` and the nonzero entries of
+`∂ηᵢH_maj`, without forming the dense `∂ηᵢΓ`.
+"""
+function build_gaussian_loggradient_cache(
+    H_BdG_func::Function,
+    η::AbstractVector{<:Number},
+    N::Int,
+    H_BdG::AbstractMatrix,
+    Γ::AbstractMatrix,
+)
+    H_maj = transform_H_to_majorana_qq(Matrix(H_BdG))
+    dim = size(H_maj, 1)
+    Fh = eigen(Hermitian(im .* Matrix(H_maj)))
+    μ = Fh.values; Uh = Fh.vectors
+    deg_tol = 1e-7 * max(maximum(abs, μ), one(eltype(μ)))
+    invden = ComplexF64[abs(μ[a] - μ[b]) > deg_tol ? 1 / (im * (μ[a] - μ[b])) : 0
+                        for a in 1:dim, b in 1:dim]
+
+    dH_ptr, dH_rows, dH_cols, dH_vals = majorana_derivative_entries(H_BdG_func, η, N)
+
+    # the pure-state test and Γ⁻¹ of get_Ok, once per state instead of once per sample
+    is_pure = Γ * Γ ≈ -I/4
+    Γinv = is_pure ? nothing : inv(lu!(copy(Γ); check=false))
+    return GaussianLogGradientCache(Uh, invden, dH_ptr, dH_rows, dH_cols, dH_vals, is_pure, Γinv)
+end
+
+"""
+    majorana_derivative_entries(H_BdG_func, η, N)
+
+The nonzero entries of `transform_H_to_majorana_qq(∂H/∂ηᵢ)` for all parameters `ηᵢ`, as vectors
+`(ptr, rows, cols, vals)` with the entries of parameter `i` at `ptr[i]:ptr[i+1]-1`.
+
+`∂H/∂ηᵢ` is the exact finite difference of `build_H_BdG_derivatives` (one parameter at a time, never all
+dense derivatives at once). It has only a few nonzero entries, and `Ω = kron(I(N), Ω0)` of the Majorana
+transformation is block diagonal, so each nonzero entry is transformed within its 2×2 block.
+"""
+function majorana_derivative_entries(H_BdG_func::Function, η::AbstractVector{<:Number}, N::Int)
+    S = eltype(η)
+    e = zeros(S, length(η))
+    H0 = Matrix(H_BdG_func(e, N))   # affine offset H(0)
+    dim = size(H0, 1)
+    n_modes = dim ÷ 2
+
+    ptr = [1]; rows = Int[]; cols = Int[]; vals = Float64[]
+    entries = Dict{Tuple{Int,Int},ComplexF64}()
+    for a in eachindex(η)
+        e[a] = one(S)
+        dH = Matrix(H_BdG_func(e, N)) .- H0         # ∂H/∂Re ηₐ
+        if S <: Complex
+            e[a] = im * one(S)
+            dH_im = Matrix(H_BdG_func(e, N)) .- H0  # ∂H/∂Im ηₐ
+            dH = 0.5 .* (dH .- im .* dH_im)         # Wirtinger ∂H/∂ηₐ
+        end
+        e[a] = zero(S)
+
+        _majorana_entries!(entries, dH, n_modes)
+        for (key, value) in sort!(collect(entries); by=first)
+            h_maj = 2 * imag(value)                 # the Majorana generator, as in transform_H_to_majorana_qq
+            iszero(h_maj) && continue
+            push!(rows, key[1]); push!(cols, key[2]); push!(vals, h_maj)
+        end
+        push!(ptr, length(rows) + 1)
+    end
+    return ptr, rows, cols, vals
+end
+
+# Accumulates the nonzero entries of Ω H_qq Ω' for the qp-ordered matrix `dH` (a function barrier: the
+# type of `dH` is only known at run time in the caller).
+function _majorana_entries!(entries::Dict{Tuple{Int,Int},ComplexF64}, dH::AbstractMatrix, n_modes::Int)
+    Ω0 = [1 1; im -im] ./ sqrt(2)
+    # qp-ordered index -> (2×2 block, index in the block) of the qq ordering
+    qq_block(r) = r <= n_modes ? (r, 1) : (r - n_modes, 2)
+    # (Ω H_qq Ω')[x,y] = Σ Ω0[ρ,α] H_qq[(i,α),(j,β)] conj(Ω0[σ,β]) with x = (i,ρ), y = (j,σ)
+    empty!(entries)
+    @inbounds for c in axes(dH, 2), r in axes(dH, 1)
+        h = dH[r, c]
+        iszero(h) && continue
+        (i, α), (j, β) = qq_block(r), qq_block(c)
+        for σ in 1:2, ρ in 1:2
+            key = (2i - 2 + ρ, 2j - 2 + σ)
+            entries[key] = get(entries, key, zero(ComplexF64)) + Ω0[ρ, α] * h * conj(Ω0[σ, β])
+        end
+    end
+    return entries
+end
+
+"""
+    loggradient_weights(cache::GaussianLogGradientCache, Γ, G)
+
+Returns `Y` with `Tr(G ∂ηᵢΓ) = Σ_kl Y[l,k] (∂ηᵢH_maj)[k,l]` for every parameter (see `GaussianLogGradientCache`).
+"""
+function loggradient_weights(cache::GaussianLogGradientCache, Γ::AbstractMatrix, G::AbstractMatrix)
+    Uh = cache.Uh
+    W = transpose(Uh' * G * Uh) .* cache.invden
+    V = Uh * transpose(W) * Uh'
+    return Γ * V - V * Γ
 end
 
 """
